@@ -44,6 +44,7 @@ jobs:
           cat > app/src/main/AndroidManifest.xml <<'BOTEOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
               <application android:label="BottleBot" android:theme="@android:style/Theme.Material.Light">
@@ -71,16 +72,20 @@ jobs:
           package com.example.bottlebot
 
           import android.app.*
+          import android.content.ContentValues
           import android.content.Intent
           import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
           import android.graphics.Color
           import android.graphics.PixelFormat
           import android.hardware.display.DisplayManager
           import android.hardware.display.VirtualDisplay
+          import android.media.Image
           import android.media.ImageReader
           import android.media.projection.MediaProjection
           import android.media.projection.MediaProjectionManager
           import android.os.*
+          import android.provider.MediaStore
           import kotlin.math.abs
 
           class CaptureService : Service() {
@@ -93,8 +98,32 @@ jobs:
               private var tol = 60
               private var lastTap = 0L
               private var armedAt = Long.MAX_VALUE
+              private var lastCloseScan = 0L
+              private var lastAction = 0L
+              private var lastShot = 0L
+              private var latest: Image? = null
+              private var status = ""
+              private var running = false
+              private lateinit var nm: NotificationManager
 
               override fun onBind(i: Intent?): IBinder? = null
+
+              private fun notif(text: String) = Notification.Builder(this, "bot")
+                  .setContentTitle("BottleBot").setContentText(text)
+                  .setSmallIcon(android.R.drawable.ic_menu_camera).setOnlyAlertOnce(true).build()
+
+              private fun setStatus(s: String) {
+                  if (s != status) { status = s; nm.notify(1, notif(s)) }
+              }
+
+              // Screen static ho toh naya frame nahi aata, isliye har 150ms last frame par kaam karte hain
+              private val tick = object : Runnable {
+                  override fun run() {
+                      if (!running) return
+                      try { latest?.let { process(it) } } catch (e: Exception) { setStatus("Error: " + e.javaClass.simpleName) }
+                      handler.postDelayed(this, 150)
+                  }
+              }
 
               @Suppress("DEPRECATION")
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -102,12 +131,9 @@ jobs:
                   target = intent.getIntExtra("color", Color.GREEN)
                   tol = intent.getIntExtra("tol", 60)
 
-                  val ch = "bot"
-                  getSystemService(NotificationManager::class.java)
-                      .createNotificationChannel(NotificationChannel(ch, "BottleBot", NotificationManager.IMPORTANCE_LOW))
-                  val n = Notification.Builder(this, ch).setContentTitle("BottleBot chal raha hai")
-                      .setSmallIcon(android.R.drawable.ic_menu_camera).build()
-                  startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("bot", "BottleBot", NotificationManager.IMPORTANCE_LOW))
+                  startForeground(1, notif("Shuru ho gaya"), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
 
                   val mpm = getSystemService(MediaProjectionManager::class.java)
                   projection = mpm.getMediaProjection(intent.getIntExtra("code", 0), intent.getParcelableExtra("data")!!)
@@ -115,103 +141,145 @@ jobs:
 
                   val dm = resources.displayMetrics
                   val w = dm.widthPixels; val h = dm.heightPixels
-                  reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                  reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
                   display = projection!!.createVirtualDisplay("bot", w, h, dm.densityDpi,
                       DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, handler)
-                  reader!!.setOnImageAvailableListener({ process(it) }, handler)
+                  reader!!.setOnImageAvailableListener({ r ->
+                      val n = r.acquireLatestImage() ?: return@setOnImageAvailableListener
+                      val old = latest
+                      latest = n
+                      old?.close()
+                  }, handler)
 
+                  running = true
                   armedAt = SystemClock.uptimeMillis() + 1000
+                  lastAction = SystemClock.uptimeMillis()
+                  handler.post(tick)
                   return START_NOT_STICKY
               }
 
-              private var lastCloseScan = 0L
-
-              private fun process(r: ImageReader) {
-                  val img = r.acquireLatestImage() ?: return
+              private fun saveShot(img: Image) {
                   try {
-                      val now = SystemClock.uptimeMillis()
-                      if (now < armedAt || now - lastTap < 900) return
-                      val plane = img.planes[0]
-                      val buf = plane.buffer
-                      val rs = plane.rowStride; val ps = plane.pixelStride
+                      val p = img.planes[0]
                       val w = img.width; val h = img.height
-                      fun ch(x: Int, y: Int, k: Int) = buf.get(y * rs + x * ps + k).toInt() and 0xFF
-                      fun lum(x: Int, y: Int) = (299 * ch(x, y, 0) + 587 * ch(x, y, 1) + 114 * ch(x, y, 2)) / 1000
-                      fun near(fx: Float, fy: Float, r0: Int, g0: Int, b0: Int, t: Int = 30): Boolean {
-                          val x = (fx * w).toInt(); val y = (fy * h).toInt()
-                          return abs(ch(x, y, 0) - r0) < t && abs(ch(x, y, 1) - g0) < t && abs(ch(x, y, 2) - b0) < t
+                      val bmp = Bitmap.createBitmap(p.rowStride / p.pixelStride, h, Bitmap.Config.ARGB_8888)
+                      p.buffer.rewind()
+                      bmp.copyPixelsFromBuffer(p.buffer)
+                      val out = Bitmap.createBitmap(bmp, 0, 0, w, h)
+                      val cv = ContentValues().apply {
+                          put(MediaStore.Images.Media.DISPLAY_NAME, "stuck_" + System.currentTimeMillis() + ".jpg")
+                          put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                          put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/BottleBot")
                       }
-                      fun uiTap(x: Float, y: Float) { TapService.instance?.tap(x, y); lastTap = now + 600 }
+                      val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv) ?: return
+                      contentResolver.openOutputStream(uri)?.use { out.compress(Bitmap.CompressFormat.JPEG, 80, it) }
+                  } catch (e: Exception) { }
+              }
 
-                      // 0) "Game Paused" (ad ke baad) -> Continue
-                      if (near(.5f, .382f, 241, 152, 10, 40) && near(.185f, .612f, 255, 255, 255) &&
-                          near(.454f, .612f, 255, 255, 255) && near(.593f, .631f, 24, 145, 68) &&
-                          near(.796f, .631f, 24, 145, 68)) {
-                          uiTap(.679f * w, .614f * h); return
+              private fun process(img: Image) {
+                  val now = SystemClock.uptimeMillis()
+                  if (now < armedAt) return
+                  val plane = img.planes[0]
+                  val buf = plane.buffer
+                  val rs = plane.rowStride; val ps = plane.pixelStride
+                  val w = img.width; val h = img.height
+
+                  if (TapService.instance == null) { setStatus("Accessibility ON nahi hai!"); return }
+                  if (now - lastAction > 8000 && now - lastShot > 30000) {
+                      lastShot = now
+                      saveShot(img)
+                      setStatus("Atka hai: screenshot Gallery > BottleBot mein save hua")
+                  }
+                  if (now - lastTap < 900) return
+
+                  fun ch(x: Int, y: Int, k: Int) = buf.get(y * rs + x * ps + k).toInt() and 0xFF
+                  fun lum(x: Int, y: Int) = (299 * ch(x, y, 0) + 587 * ch(x, y, 1) + 114 * ch(x, y, 2)) / 1000
+                  fun near(fx: Float, fy: Float, r0: Int, g0: Int, b0: Int, t: Int = 30): Boolean {
+                      val x = (fx * w).toInt(); val y = (fy * h).toInt()
+                      return abs(ch(x, y, 0) - r0) < t && abs(ch(x, y, 1) - g0) < t && abs(ch(x, y, 2) - b0) < t
+                  }
+                  fun uiTap(label: String, x: Float, y: Float) {
+                      TapService.instance?.tap(x, y)
+                      lastTap = now + 600; lastAction = now
+                      setStatus(label)
+                  }
+
+                  // 0) "Game Paused" (ad ke baad) -> Continue
+                  if (near(.5f, .382f, 241, 152, 10, 40) && near(.185f, .612f, 255, 255, 255) &&
+                      near(.454f, .612f, 255, 255, 255) && near(.593f, .631f, 24, 145, 68) &&
+                      near(.796f, .631f, 24, 145, 68)) {
+                      uiTap("Paused screen: Continue", .679f * w, .614f * h); return
+                  }
+                  // 1) Reward screen -> "No thanks" (Collect/ad kabhi nahi dabata)
+                  if (near(.185f, .607f, 255, 255, 255) && near(.454f, .607f, 255, 255, 255) &&
+                      near(.593f, .623f, 25, 152, 73) && near(.796f, .623f, 25, 152, 73)) {
+                      uiTap("Reward screen: No thanks", .321f * w, .607f * h); return
+                  }
+                  // 2) Home screen -> PLAY
+                  if (near(.306f, .571f, 248, 191, 40) && near(.685f, .571f, 248, 191, 40) &&
+                      near(.306f, .642f, 27, 178, 83)) {
+                      uiTap("Home screen: PLAY", .5f * w, .572f * h); return
+                  }
+                  // 3) Ad ka close button: pehle accessibility, phir X-shape pixel search (kisi bhi corner mein)
+                  if (now - lastCloseScan > 700) {
+                      lastCloseScan = now
+                      if (TapService.instance?.clickClose() == true) {
+                          lastTap = now + 600; lastAction = now; setStatus("Ad: Close dabaya"); return
                       }
-                      // 1) Reward screen -> "No thanks" (Collect/ad kabhi nahi dabata)
-                      if (near(.185f, .607f, 255, 255, 255) && near(.454f, .607f, 255, 255, 255) &&
-                          near(.593f, .623f, 25, 152, 73) && near(.796f, .623f, 25, 152, 73)) {
-                          uiTap(.321f * w, .607f * h); return
-                      }
-                      // 2) Home screen -> PLAY
-                      if (near(.306f, .571f, 248, 191, 40) && near(.685f, .571f, 248, 191, 40) &&
-                          near(.306f, .642f, 27, 178, 83)) {
-                          uiTap(.5f * w, .572f * h); return
-                      }
-                      // 3) Ad ka close button: pehle accessibility, phir X-shape pixel search (kisi bhi corner mein)
-                      if (now - lastCloseScan > 700) {
-                          lastCloseScan = now
-                          if (TapService.instance?.clickClose() == true) { lastTap = now + 600; return }
-                          val rr = 14; val mg = rr + 8
-                          for ((x0, x1) in listOf(0 to (0.3f * w).toInt(), (0.7f * w).toInt() to w)) {
-                              var cy = (0.02f * h).toInt()
-                              while (cy < (0.12f * h).toInt()) {
-                                  var cx = maxOf(x0, mg)
-                                  while (cx < minOf(x1, w - mg - 1)) {
-                                      val d = ArrayList<Int>()
-                                      for (k in intArrayOf(4, 8, 12)) for (a in intArrayOf(-1, 1)) for (b in intArrayOf(-1, 1))
-                                          d.add(lum(cx + k * b, cy + k * a))
-                                      val m = listOf(lum(cx, cy - rr), lum(cx, cy + rr), lum(cx - rr, cy), lum(cx + rr, cy),
-                                          lum(cx, cy - rr - 6), lum(cx, cy + rr + 6), lum(cx - rr - 6, cy), lum(cx + rr + 6, cy))
-                                      val dm = d.average(); val mm = m.average()
-                                      if (abs(dm - mm) > 100 && (d.max() - d.min()) < 90 && (m.max() - m.min()) < 90) {
-                                          uiTap(cx.toFloat(), cy.toFloat()); return
-                                      }
-                                      cx += 4
+                      val rr = 14; val mg = rr + 8
+                      for ((x0, x1) in listOf(0 to (0.3f * w).toInt(), (0.7f * w).toInt() to w)) {
+                          var cy = (0.02f * h).toInt()
+                          while (cy < (0.12f * h).toInt()) {
+                              var cx = maxOf(x0, mg)
+                              while (cx < minOf(x1, w - mg - 1)) {
+                                  val d = ArrayList<Int>()
+                                  for (k in intArrayOf(4, 8, 12)) for (a in intArrayOf(-1, 1)) for (b in intArrayOf(-1, 1))
+                                      d.add(lum(cx + k * b, cy + k * a))
+                                  val m = listOf(lum(cx, cy - rr), lum(cx, cy + rr), lum(cx - rr, cy), lum(cx + rr, cy),
+                                      lum(cx, cy - rr - 6), lum(cx, cy + rr + 6), lum(cx - rr - 6, cy), lum(cx + rr + 6, cy))
+                                  val dm = d.average(); val mm = m.average()
+                                  if (abs(dm - mm) > 100 && (d.max() - d.min()) < 90 && (m.max() - m.min()) < 90) {
+                                      uiTap("Ad: X dabaya", cx.toFloat(), cy.toFloat()); return
                                   }
-                                  cy += 4
+                                  cx += 4
                               }
+                              cy += 4
                           }
                       }
+                  }
 
-                      // 4) Gameplay: bottle dhoondh kar tap
-                      val tr = Color.red(target); val tg = Color.green(target); val tb = Color.blue(target)
-                      val cells = HashMap<Int, IntArray>()
-                      val step = 12
-                      var y = (h * 0.12).toInt()
-                      val yEnd = (h * 0.80).toInt() // cannon aur upar ka HUD chhod do
-                      while (y < yEnd) {
-                          var x = 0
-                          while (x < w) {
-                              if (abs(ch(x, y, 0) - tr) < tol && abs(ch(x, y, 1) - tg) < tol && abs(ch(x, y, 2) - tb) < tol) {
-                                  val key = (y / 80) * 1000 + (x / 80)
-                                  val c = cells.getOrPut(key) { IntArray(3) }
-                                  c[0]++; c[1] += x; c[2] += y
-                              }
-                              x += step
+                  // 4) Gameplay: bottle dhoondh kar tap
+                  val tr = Color.red(target); val tg = Color.green(target); val tb = Color.blue(target)
+                  val cells = HashMap<Int, IntArray>()
+                  val step = 12
+                  var y = (h * 0.12).toInt()
+                  val yEnd = (h * 0.80).toInt() // cannon aur upar ka HUD chhod do
+                  while (y < yEnd) {
+                      var x = 0
+                      while (x < w) {
+                          if (abs(ch(x, y, 0) - tr) < tol && abs(ch(x, y, 1) - tg) < tol && abs(ch(x, y, 2) - tb) < tol) {
+                              val key = (y / 80) * 1000 + (x / 80)
+                              val c = cells.getOrPut(key) { IntArray(3) }
+                              c[0]++; c[1] += x; c[2] += y
                           }
-                          y += step
+                          x += step
                       }
-                      val best = cells.values.maxByOrNull { it[0] }
-                      if (best != null && best[0] >= 5) {
-                          TapService.instance?.tap(best[1].toFloat() / best[0], best[2].toFloat() / best[0])
-                          lastTap = now
-                      }
-                  } finally { img.close() }
+                      y += step
+                  }
+                  val best = cells.values.maxByOrNull { it[0] }
+                  if (best != null && best[0] >= 5) {
+                      TapService.instance?.tap(best[1].toFloat() / best[0], best[2].toFloat() / best[0])
+                      lastTap = now; lastAction = now
+                      setStatus("Bottle tod raha hai")
+                  } else {
+                      setStatus("Kuch pehchana nahi (bottle/button nahi dikha)")
+                  }
               }
 
               override fun onDestroy() {
+                  running = false
+                  handler.removeCallbacks(tick)
+                  latest?.close()
                   display?.release(); reader?.close(); projection?.stop(); thread.quit()
                   super.onDestroy()
               }
@@ -225,6 +293,7 @@ jobs:
           import android.content.Intent
           import android.graphics.Color
           import android.media.projection.MediaProjectionManager
+          import android.os.Build
           import android.os.Bundle
           import android.provider.Settings
           import android.widget.*
@@ -235,6 +304,7 @@ jobs:
 
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 0)
                   val l = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
                   hex = EditText(this).apply { hint = "Bottle color (hex)"; setText("#28BE5F") }
                   tol = EditText(this).apply { hint = "Tolerance"; setText("25") }
