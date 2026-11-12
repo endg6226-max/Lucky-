@@ -117,4 +117,247 @@ jobs:
                   val w = dm.widthPixels; val h = dm.heightPixels
                   reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
                   display = projection!!.createVirtualDisplay("bot", w, h, dm.densityDpi,
-                      Dis
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, handler)
+                  reader!!.setOnImageAvailableListener({ process(it) }, handler)
+
+                  armedAt = SystemClock.uptimeMillis() + 1000
+                  return START_NOT_STICKY
+              }
+
+              private var lastCloseScan = 0L
+
+              private fun process(r: ImageReader) {
+                  val img = r.acquireLatestImage() ?: return
+                  try {
+                      val now = SystemClock.uptimeMillis()
+                      if (now < armedAt || now - lastTap < 900) return
+                      val plane = img.planes[0]
+                      val buf = plane.buffer
+                      val rs = plane.rowStride; val ps = plane.pixelStride
+                      val w = img.width; val h = img.height
+                      fun ch(x: Int, y: Int, k: Int) = buf.get(y * rs + x * ps + k).toInt() and 0xFF
+                      fun lum(x: Int, y: Int) = (299 * ch(x, y, 0) + 587 * ch(x, y, 1) + 114 * ch(x, y, 2)) / 1000
+                      fun near(fx: Float, fy: Float, r0: Int, g0: Int, b0: Int, t: Int = 30): Boolean {
+                          val x = (fx * w).toInt(); val y = (fy * h).toInt()
+                          return abs(ch(x, y, 0) - r0) < t && abs(ch(x, y, 1) - g0) < t && abs(ch(x, y, 2) - b0) < t
+                      }
+                      fun uiTap(x: Float, y: Float) { TapService.instance?.tap(x, y); lastTap = now + 600 }
+
+                      // 0) "Game Paused" (ad ke baad) -> Continue
+                      if (near(.5f, .382f, 241, 152, 10, 40) && near(.185f, .612f, 255, 255, 255) &&
+                          near(.454f, .612f, 255, 255, 255) && near(.593f, .631f, 24, 145, 68) &&
+                          near(.796f, .631f, 24, 145, 68)) {
+                          uiTap(.679f * w, .614f * h); return
+                      }
+                      // 1) Reward screen -> "No thanks" (Collect/ad kabhi nahi dabata)
+                      if (near(.185f, .607f, 255, 255, 255) && near(.454f, .607f, 255, 255, 255) &&
+                          near(.593f, .623f, 25, 152, 73) && near(.796f, .623f, 25, 152, 73)) {
+                          uiTap(.321f * w, .607f * h); return
+                      }
+                      // 2) Home screen -> PLAY
+                      if (near(.306f, .571f, 248, 191, 40) && near(.685f, .571f, 248, 191, 40) &&
+                          near(.306f, .642f, 27, 178, 83)) {
+                          uiTap(.5f * w, .572f * h); return
+                      }
+                      // 3) Ad ka close button: pehle accessibility, phir X-shape pixel search (kisi bhi corner mein)
+                      if (now - lastCloseScan > 700) {
+                          lastCloseScan = now
+                          if (TapService.instance?.clickClose() == true) { lastTap = now + 600; return }
+                          val rr = 14; val mg = rr + 8
+                          for ((x0, x1) in listOf(0 to (0.3f * w).toInt(), (0.7f * w).toInt() to w)) {
+                              var cy = (0.02f * h).toInt()
+                              while (cy < (0.12f * h).toInt()) {
+                                  var cx = maxOf(x0, mg)
+                                  while (cx < minOf(x1, w - mg - 1)) {
+                                      val d = ArrayList<Int>()
+                                      for (k in intArrayOf(4, 8, 12)) for (a in intArrayOf(-1, 1)) for (b in intArrayOf(-1, 1))
+                                          d.add(lum(cx + k * b, cy + k * a))
+                                      val m = listOf(lum(cx, cy - rr), lum(cx, cy + rr), lum(cx - rr, cy), lum(cx + rr, cy),
+                                          lum(cx, cy - rr - 6), lum(cx, cy + rr + 6), lum(cx - rr - 6, cy), lum(cx + rr + 6, cy))
+                                      val dm = d.average(); val mm = m.average()
+                                      if (abs(dm - mm) > 100 && (d.max() - d.min()) < 90 && (m.max() - m.min()) < 90) {
+                                          uiTap(cx.toFloat(), cy.toFloat()); return
+                                      }
+                                      cx += 4
+                                  }
+                                  cy += 4
+                              }
+                          }
+                      }
+
+                      // 4) Gameplay: bottle dhoondh kar tap
+                      val tr = Color.red(target); val tg = Color.green(target); val tb = Color.blue(target)
+                      val cells = HashMap<Int, IntArray>()
+                      val step = 12
+                      var y = (h * 0.12).toInt()
+                      val yEnd = (h * 0.80).toInt() // cannon aur upar ka HUD chhod do
+                      while (y < yEnd) {
+                          var x = 0
+                          while (x < w) {
+                              if (abs(ch(x, y, 0) - tr) < tol && abs(ch(x, y, 1) - tg) < tol && abs(ch(x, y, 2) - tb) < tol) {
+                                  val key = (y / 80) * 1000 + (x / 80)
+                                  val c = cells.getOrPut(key) { IntArray(3) }
+                                  c[0]++; c[1] += x; c[2] += y
+                              }
+                              x += step
+                          }
+                          y += step
+                      }
+                      val best = cells.values.maxByOrNull { it[0] }
+                      if (best != null && best[0] >= 5) {
+                          TapService.instance?.tap(best[1].toFloat() / best[0], best[2].toFloat() / best[0])
+                          lastTap = now
+                      }
+                  } finally { img.close() }
+              }
+
+              override fun onDestroy() {
+                  display?.release(); reader?.close(); projection?.stop(); thread.quit()
+                  super.onDestroy()
+              }
+          }
+          BOTEOF
+          mkdir -p app/src/main/java/com/example/bottlebot
+          cat > app/src/main/java/com/example/bottlebot/MainActivity.kt <<'BOTEOF'
+          package com.example.bottlebot
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.media.projection.MediaProjectionManager
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var hex: EditText
+              private lateinit var tol: EditText
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val l = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
+                  hex = EditText(this).apply { hint = "Bottle color (hex)"; setText("#28BE5F") }
+                  tol = EditText(this).apply { hint = "Tolerance"; setText("25") }
+                  fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }
+                  l.addView(TextView(this).apply { text = "BottleBot: screen par bottle ka color dhoondh kar tap karta hai" })
+                  l.addView(hex); l.addView(tol)
+                  l.addView(btn("1. Accessibility ON karo") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) })
+                  l.addView(btn("2. Start") {
+                      val m = getSystemService(MediaProjectionManager::class.java)
+                      startActivityForResult(m.createScreenCaptureIntent(), 1)
+                  })
+                  l.addView(btn("Stop") { startService(Intent(this, CaptureService::class.java).setAction("STOP")) })
+                  setContentView(l)
+              }
+
+              @Deprecated("simple")
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  if (req == 1 && res == RESULT_OK && data != null) {
+                      val i = Intent(this, CaptureService::class.java)
+                          .putExtra("code", res).putExtra("data", data)
+                          .putExtra("color", runCatching { Color.parseColor(hex.text.toString()) }.getOrDefault(Color.GREEN))
+                          .putExtra("tol", tol.text.toString().toIntOrNull() ?: 60)
+                      startForegroundService(i)
+                  }
+              }
+          }
+          BOTEOF
+          mkdir -p app/src/main/java/com/example/bottlebot
+          cat > app/src/main/java/com/example/bottlebot/TapService.kt <<'BOTEOF'
+          package com.example.bottlebot
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.view.accessibility.AccessibilityEvent
+
+          class TapService : AccessibilityService() {
+              companion object { var instance: TapService? = null }
+
+              override fun onServiceConnected() { instance = this }
+              override fun onUnbind(intent: Intent?): Boolean { instance = null; return super.onUnbind(intent) }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              fun tap(x: Float, y: Float) {
+                  val path = Path().apply { moveTo(x, y) }
+                  val g = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, 40))
+                      .build()
+                  dispatchGesture(g, null, null)
+              }
+
+              /** Ad ka Close/Dismiss button accessibility tree se dhoondh kar dabata hai (kisi bhi position par). */
+              fun clickClose(): Boolean {
+                  val root = rootInActiveWindow ?: return false
+                  val stack = ArrayDeque<AccessibilityNodeInfo>()
+                  stack.add(root)
+                  while (stack.isNotEmpty()) {
+                      val n = stack.removeLast()
+                      val t = ((n.contentDescription ?: n.text)?.toString() ?: "").trim().lowercase()
+                      val id = (n.viewIdResourceName ?: "").lowercase()
+                      val hit = t.contains("close") || t.contains("dismiss") ||
+                          t == "x" || t == "\u00d7" || t == "\u2715" || id.contains("close")
+                      if (hit && n.isVisibleToUser) {
+                          var c: AccessibilityNodeInfo? = n
+                          while (c != null && !c.isClickable) c = c.parent
+                          if (c != null && c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+                          val r = Rect(); n.getBoundsInScreen(r)
+                          if (!r.isEmpty) { tap(r.exactCenterX(), r.exactCenterY()); return true }
+                      }
+                      for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
+                  }
+                  return false
+              }
+          }
+          BOTEOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'BOTEOF'
+          <resources>
+              <string name="app_name">BottleBot</string>
+          </resources>
+          BOTEOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'BOTEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:canPerformGestures="true"
+              android:canRetrieveWindowContent="true"
+              android:accessibilityFlags="flagReportViewIds"
+              android:accessibilityEventTypes="typeNotificationStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:description="@string/app_name" />
+          BOTEOF
+          mkdir -p .
+          cat > build.gradle.kts <<'BOTEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          BOTEOF
+          mkdir -p .
+          cat > gradle.properties <<'BOTEOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          kotlin.code.style=official
+          BOTEOF
+          mkdir -p .
+          cat > settings.gradle.kts <<'BOTEOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "BottleBot"
+          include(":app")
+          BOTEOF
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BottleBot-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
